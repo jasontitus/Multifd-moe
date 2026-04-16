@@ -301,6 +301,18 @@ extern "C" {
         // Optional dynamic-quant policy file reserved for future bank selection work.
         const char * moe_quant_map;
 
+        // N-Way Weighted I/O Scheduler: path to the nway JSON manifest produced
+        // by tools/gguf-nway-split.py.  When set, expert tensor reads are fanned
+        // out across the chunk files listed in the manifest.
+        const char * nway_manifest_path;
+
+        // N-Way chunk file paths (NULL-terminated array of C strings).
+        // If non-NULL, overrides the chunk_files array inside the manifest.
+        const char ** nway_chunk_paths;
+
+        // Number of entries in nway_chunk_paths (0 when not used).
+        int32_t nway_n_chunks;
+
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
 

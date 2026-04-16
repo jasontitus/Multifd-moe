@@ -598,6 +598,30 @@ struct llama_model {
     const char * flash_moe_trace_file() const;
     const llama_flash_moe_sidecar_entry * flash_moe_sidecar_entry_for(const char * name) const;
 
+    // N-Way Weighted I/O Scheduler accessors.
+    bool nway_enabled() const;
+    int32_t nway_n_chunks() const;
+    const std::vector<int> & nway_fds() const;
+    const std::vector<std::string> & nway_chunk_paths() const;
+
+    // N-Way fragment descriptor (mirrored from impl for context access).
+    struct nway_fragment {
+        int32_t file_id;
+        size_t  offset;
+        size_t  size;
+    };
+    struct nway_tensor_entry {
+        std::string tensor_name;
+        std::string tensor_family;
+        int32_t     layer;
+        int32_t     n_experts;
+        size_t      bytes_per_expert;
+        size_t      exact_byte_length;
+        size_t      aligned_byte_length;
+        std::vector<nway_fragment> fragments;
+    };
+    const nway_tensor_entry * nway_entry_for(const char * name) const;
+
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 

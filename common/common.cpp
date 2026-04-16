@@ -1360,6 +1360,24 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_topk_override  = params.moe_topk_override;
     mparams.moe_cache_io_split = params.moe_cache_io_split;
 
+    // N-Way weighted I/O scheduler
+    mparams.nway_manifest_path = params.nway_manifest.empty() ? nullptr : params.nway_manifest.c_str();
+    // Keep the c_str() pointers alive for the duration of the model load
+    // by storing them in a static vector (the common_params outlives the model load).
+    static std::vector<const char *> nway_cstrs;
+    nway_cstrs.clear();
+    for (const auto & p : params.nway_chunks) {
+        nway_cstrs.push_back(p.c_str());
+    }
+    if (!nway_cstrs.empty()) {
+        nway_cstrs.push_back(nullptr); // NULL-terminated
+        mparams.nway_chunk_paths = nway_cstrs.data();
+        mparams.nway_n_chunks    = (int32_t)(nway_cstrs.size() - 1);
+    } else {
+        mparams.nway_chunk_paths = nullptr;
+        mparams.nway_n_chunks    = 0;
+    }
+
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {

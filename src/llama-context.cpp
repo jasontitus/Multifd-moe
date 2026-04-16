@@ -141,6 +141,20 @@ public:
                     __func__, cache_io_split);
         }
 
+        // Initialize N-Way Weighted I/O Scheduler if enabled on the model.
+        if (model.nway_enabled()) {
+            nway_enabled = true;
+            nway_fds = model.nway_fds();  // copy FD vector (model owns the FDs)
+
+            // Ensure the read pool is started for multi-FD dispatch.
+            if (read_pool.workers.empty()) {
+                start_read_pool();
+            }
+
+            LLAMA_LOG_INFO("%s: N-Way weighted I/O scheduler active with %d chunk FDs in slot-bank runtime\n",
+                    __func__, (int) nway_fds.size());
+        }
+
         if (mixed_slot_buffer) {
             LLAMA_LOG_INFO("%s: Flash-MoE mixed slot staging is enabled; miss reads will batch into slot-shaped buffers before tensor uploads\n",
                     __func__);
@@ -725,6 +739,10 @@ private:
     std::mutex fds_mutex;
     std::unordered_map<std::string, int> fds;
     std::unordered_map<std::string, resident_bank_file> resident_banks;
+
+    // N-Way Weighted I/O Scheduler state (cached from model).
+    bool nway_enabled = false;
+    std::vector<int> nway_fds;  // borrowed FDs from llama_model — do NOT close
     std::unordered_map<ggml_backend_dev_t, async_slot_uploader> async_uploaders;
     read_thread_pool read_pool;
     std::vector<int32_t> topk_ids;
@@ -1589,11 +1607,12 @@ private:
         const double miss_bytes_gib = total.bytes_loaded / 1024.0 / 1024.0 / 1024.0;
         const int64_t other_us = total.total_us - total.topk_read_us - total.slot_resolve_us - total.install_us - total.slot_write_us - total.trace_write_us;
 
-        LLAMA_LOG_INFO("%s: Flash-MoE routed src=%s calls=%" PRIu64 " refs=%" PRIu64 " uniq=%" PRIu64 " hit=%.1f%% miss/call=%.2f bytes=%.2f GiB topk=%.3f ms resolve=%.3f ms install=%.3f ms source=%.3f ms upload=%.3f ms slotwr=%.3f ms trace=%.3f ms other=%.3f ms pread=%" PRIu64 " rcopy=%" PRIu64 " iosplit=%d async=%s preads=%s batchrd=%s mixbuf=%s cpuvis=%s\n",
+        LLAMA_LOG_INFO("%s: Flash-MoE routed src=%s calls=%" PRIu64 " refs=%" PRIu64 " uniq=%" PRIu64 " hit=%.1f%% miss/call=%.2f bytes=%.2f GiB topk=%.3f ms resolve=%.3f ms install=%.3f ms source=%.3f ms upload=%.3f ms slotwr=%.3f ms trace=%.3f ms other=%.3f ms pread=%" PRIu64 " rcopy=%" PRIu64 " iosplit=%d async=%s preads=%s batchrd=%s mixbuf=%s cpuvis=%s nway=%s\n",
                 __func__,
                 resident_bank_source ? "resident-packed" :
                 oracle_all_hit ? "oracle-all-hit" :
-                oracle_prefetch ? "oracle-prefetch" : "pread-slot-bank",
+                oracle_prefetch ? "oracle-prefetch" :
+                nway_enabled ? "nway-multifd" : "pread-slot-bank",
                 total.calls, total.token_refs, total.unique_experts, hit_pct, miss_per_call, miss_bytes_gib,
                 total.topk_read_us / 1000.0, total.slot_resolve_us / 1000.0, total.install_us / 1000.0,
                 total.source_us / 1000.0, total.upload_us / 1000.0, total.slot_write_us / 1000.0,
@@ -1604,7 +1623,8 @@ private:
                 parallel_slot_reads ? "on" : "off",
                 effective_batched_install_reads() ? "on" : "off",
                 mixed_slot_buffer ? "on" : "off",
-                cpu_visible_slot_writes_enabled() ? "on" : "off");
+                cpu_visible_slot_writes_enabled() ? "on" : "off",
+                nway_enabled ? "on" : "off");
         if (total.bytes_loaded > 0 || total.gate_up_install_us > 0 || total.gate_install_us > 0 || total.up_install_us > 0 || total.down_install_us > 0) {
             LLAMA_LOG_INFO("%s: Flash-MoE install gate_up=%.3f ms / %.2f GiB gate=%.3f ms / %.2f GiB up=%.3f ms / %.2f GiB down=%.3f ms / %.2f GiB\n",
                     __func__,
@@ -2016,6 +2036,159 @@ private:
         return metrics;
     }
 
+    // ---- N-Way Weighted I/O: fan-out read across multiple FDs ----
+    //
+    // When nway_enabled, the tensor's data is split across N chunk files.
+    // Each expert's bytes are distributed across the chunks according to
+    // the manifest's fragment descriptors.  We issue one pread per fragment
+    // (each targeting a different FD / physical volume) in parallel, then
+    // reassemble the contiguous expert buffer.
+    //
+    install_metrics read_expert_bytes_nway(
+            const llama_flash_moe_sidecar_entry * entry,
+            int32_t expert,
+            uint8_t * out) {
+        install_metrics metrics;
+
+        const auto * nway_entry = model.nway_entry_for(entry->tensor_name.c_str());
+        if (nway_entry == nullptr) {
+            // Tensor not in the nway manifest — fall back to the standard
+            // single-FD path silently.
+            return { .bytes = SIZE_MAX }; // sentinel: caller should use default path
+        }
+
+        // Compute the byte range for this expert within the full tensor.
+        const size_t expert_start = size_t(expert) * entry->bytes_per_expert;
+        const size_t expert_end   = expert_start + entry->bytes_per_expert;
+
+        metrics.bytes = entry->bytes_per_expert;
+        const int64_t t_read_start_us = ggml_time_us();
+
+        // Build pread tasks: one per fragment that overlaps this expert's byte range.
+        std::vector<pread_task> tasks;
+        tasks.reserve(nway_entry->fragments.size());
+
+        size_t frag_global_cursor = 0; // running global byte offset across all fragments
+        size_t out_cursor = 0;         // write position in the output buffer
+
+        for (const auto & frag : nway_entry->fragments) {
+            const size_t frag_global_start = frag_global_cursor;
+            const size_t frag_global_end   = frag_global_start + frag.size;
+            frag_global_cursor = frag_global_end;
+
+            // Check if this fragment overlaps the expert's byte range.
+            if (frag_global_end <= expert_start || frag_global_start >= expert_end) {
+                continue; // no overlap
+            }
+
+            // Compute the overlap region.
+            const size_t overlap_start = std::max(frag_global_start, expert_start);
+            const size_t overlap_end   = std::min(frag_global_end, expert_end);
+            const size_t read_size     = overlap_end - overlap_start;
+
+            // Offset within this fragment's file.
+            const size_t offset_in_frag = overlap_start - frag_global_start;
+            const off_t  file_offset    = static_cast<off_t>(frag.offset + offset_in_frag);
+
+            if (frag.file_id < 0 || frag.file_id >= (int32_t) nway_fds.size()) {
+                throw std::runtime_error(format(
+                    "N-Way read_expert_bytes: invalid file_id %d for tensor '%s' expert %d",
+                    frag.file_id, entry->tensor_name.c_str(), expert));
+            }
+
+            tasks.push_back({
+                nway_fds[frag.file_id],
+                out + out_cursor,
+                file_offset,
+                read_size,
+                0,
+                0,
+            });
+
+            out_cursor += read_size;
+        }
+
+        if (out_cursor != entry->bytes_per_expert) {
+            throw std::runtime_error(format(
+                "N-Way fragment coverage mismatch for tensor '%s' expert %d: covered %zu of %zu bytes",
+                entry->tensor_name.c_str(), expert, out_cursor, entry->bytes_per_expert));
+        }
+
+        // Dispatch all fragment reads in parallel via the thread pool.
+        execute_pread_tasks(tasks);
+
+        // Verify results.
+        ssize_t total_read = 0;
+        for (const auto & task : tasks) {
+            metrics.pread_ops++;
+            metrics.source_us += task.elapsed_us;
+            if (task.result > 0) {
+                total_read += task.result;
+            }
+        }
+
+        if (total_read != (ssize_t) entry->bytes_per_expert) {
+            throw std::runtime_error(format(
+                "N-Way failed to read expert %d for tensor '%s': got %zd of %zu bytes across %zu fragments",
+                expert, entry->tensor_name.c_str(), total_read, entry->bytes_per_expert, tasks.size()));
+        }
+
+        metrics.source_us = ggml_time_us() - t_read_start_us;
+        metrics.install_us += metrics.source_us;
+        return metrics;
+    }
+
+    // Helper: append nway pread tasks for a single expert of a tensor into
+    // the provided task vector.  Returns the number of tasks appended, or
+    // -1 if the tensor is not in the nway manifest (caller should fall back).
+    int32_t append_nway_pread_tasks(
+            const llama_flash_moe_sidecar_entry * entry,
+            int32_t expert,
+            uint8_t * dst,
+            std::vector<pread_task> & tasks) {
+        const auto * nway_entry = model.nway_entry_for(entry->tensor_name.c_str());
+        if (nway_entry == nullptr) {
+            return -1; // not in manifest
+        }
+
+        const size_t expert_start = size_t(expert) * entry->bytes_per_expert;
+        const size_t expert_end   = expert_start + entry->bytes_per_expert;
+
+        size_t frag_global_cursor = 0;
+        size_t out_cursor = 0;
+        int32_t count = 0;
+
+        for (const auto & frag : nway_entry->fragments) {
+            const size_t frag_global_start = frag_global_cursor;
+            const size_t frag_global_end   = frag_global_start + frag.size;
+            frag_global_cursor = frag_global_end;
+
+            if (frag_global_end <= expert_start || frag_global_start >= expert_end) {
+                continue;
+            }
+
+            const size_t overlap_start = std::max(frag_global_start, expert_start);
+            const size_t overlap_end   = std::min(frag_global_end, expert_end);
+            const size_t read_size     = overlap_end - overlap_start;
+            const size_t offset_in_frag = overlap_start - frag_global_start;
+            const off_t  file_offset    = static_cast<off_t>(frag.offset + offset_in_frag);
+
+            tasks.push_back({
+                nway_fds[frag.file_id],
+                dst + out_cursor,
+                file_offset,
+                read_size,
+                0,
+                0,
+            });
+
+            out_cursor += read_size;
+            count++;
+        }
+
+        return count;
+    }
+
     install_metrics read_expert_bytes(
             ggml_tensor * tensor,
             const llama_flash_moe_sidecar_entry * entry,
@@ -2028,6 +2201,16 @@ private:
 
         if (entry->source_format == llama_flash_moe_sidecar_format::affine_2bit_qwen397b) {
             return transcode_affine_2bit_qwen397b(tensor, entry, expert, out);
+        }
+
+        // ---- N-Way multi-FD dispatch (when enabled) ----
+        if (nway_enabled) {
+            install_metrics nway_result = read_expert_bytes_nway(entry, expert, out);
+            if (nway_result.bytes != SIZE_MAX) {
+                // Successfully read via N-Way path.
+                return nway_result;
+            }
+            // Sentinel SIZE_MAX means tensor not in nway manifest — fall through.
         }
 
         const off_t offset = static_cast<off_t>(entry->repacked_offset + size_t(expert) * entry->bytes_per_expert);
@@ -2248,6 +2431,19 @@ private:
                             install_field.field = &field;
                             install_field.task_begin = tasks.size();
 
+                            // Try N-Way multi-FD dispatch first.
+                            if (nway_enabled) {
+                                const int32_t nway_count = append_nway_pread_tasks(
+                                    field.entry, load.expert,
+                                    slot_buffer.bytes.data() + field.slot_offset,
+                                    tasks);
+                                if (nway_count >= 0) {
+                                    install_field.task_count = nway_count;
+                                    continue;
+                                }
+                                // Fall through to standard single-FD path.
+                            }
+
                             const int fd = fd_for(field.entry->repacked_path);
                             const off_t expert_offset = static_cast<off_t>(field.entry->repacked_offset + size_t(load.expert) * field.entry->bytes_per_expert);
                             const int32_t split = active_cache_io_split(field.entry->bytes_per_expert, cache_io_split);
@@ -2360,6 +2556,17 @@ private:
                             chunk.bytes.resize(entry->bytes_per_expert);
                         }
                         chunk.task_begin = tasks.size();
+
+                        // Try N-Way multi-FD dispatch first.
+                        if (nway_enabled) {
+                            uint8_t * dst = chunk.direct_dst != nullptr ? chunk.direct_dst : chunk.bytes.data();
+                            const int32_t nway_count = append_nway_pread_tasks(entry, load.expert, dst, tasks);
+                            if (nway_count >= 0) {
+                                chunk.task_count = nway_count;
+                                return;
+                            }
+                            // Fall through to standard single-FD path.
+                        }
 
                         const int fd = fd_for(entry->repacked_path);
                         const off_t expert_offset = static_cast<off_t>(entry->repacked_offset + size_t(load.expert) * entry->bytes_per_expert);

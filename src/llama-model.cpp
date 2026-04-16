@@ -34,6 +34,8 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <cerrno>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -430,6 +432,12 @@ struct llama_model::impl {
                 munmap(mapping.addr, mapping.size);
             }
         }
+        // Close N-Way chunk file descriptors.
+        for (int fd : nway_fds) {
+            if (fd >= 0) {
+                close(fd);
+            }
+        }
     }
 
     uint64_t n_elements = 0;
@@ -474,6 +482,32 @@ struct llama_model::impl {
     std::string flash_moe_trace_file;
     std::unordered_map<std::string, llama_flash_moe_sidecar_entry> flash_moe_sidecar_entries;
     std::vector<llama_flash_moe_sparse_mapping> flash_moe_sparse_mappings;
+
+    // ---- N-Way Weighted I/O Scheduler state ----
+    // When nway_enabled is true, expert reads fan out across multiple FDs.
+    bool nway_enabled = false;
+    int32_t nway_n_chunks = 0;
+    std::vector<int> nway_fds;                     // O_RDONLY file descriptors for each chunk file
+    std::vector<std::string> nway_chunk_paths;     // paths for logging/error messages
+
+    // Per-tensor fragment map populated from the nway manifest.
+    // Key: tensor name.  Value: ordered list of fragments.
+    struct nway_fragment {
+        int32_t file_id = -1;       // index into nway_fds
+        size_t  offset  = 0;        // byte offset within the chunk file
+        size_t  size    = 0;        // fragment size in bytes (16KB-aligned)
+    };
+    struct nway_tensor_entry {
+        std::string tensor_name;
+        std::string tensor_family;
+        int32_t     layer          = -1;
+        int32_t     n_experts      = 0;
+        size_t      bytes_per_expert = 0;
+        size_t      exact_byte_length = 0;
+        size_t      aligned_byte_length = 0;
+        std::vector<nway_fragment> fragments;     // ordered list of fragments
+    };
+    std::unordered_map<std::string, nway_tensor_entry> nway_entries;
 };
 
 static ggml_backend_buffer_t llama_flash_moe_alloc_sparse_ctx_buffer(
@@ -2966,6 +3000,88 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
         LLAMA_LOG_INFO("%s: loaded %zu Flash-MoE routed tensor entries for slot-bank mode\n",
                 __func__, pimpl->flash_moe_sidecar_entries.size());
+    }
+
+    // ---- N-Way Weighted I/O Scheduler initialization ----
+    if (params.nway_manifest_path != nullptr && params.nway_manifest_path[0] != '\0') {
+        const std::filesystem::path nway_manifest_path(params.nway_manifest_path);
+        LLAMA_LOG_INFO("%s: N-Way opening manifest %s\n", __func__, nway_manifest_path.string().c_str());
+
+        std::ifstream nway_manifest_file(nway_manifest_path);
+        if (!nway_manifest_file.is_open()) {
+            throw std::runtime_error(format("failed to open N-Way manifest: %s", nway_manifest_path.string().c_str()));
+        }
+
+        nlohmann::json nway_manifest;
+        nway_manifest_file >> nway_manifest;
+        LLAMA_LOG_INFO("%s: N-Way parsed manifest %s\n", __func__, nway_manifest_path.string().c_str());
+
+        // Determine chunk file paths — CLI override or manifest-embedded.
+        std::vector<std::string> chunk_paths;
+        if (params.nway_chunk_paths != nullptr && params.nway_n_chunks > 0) {
+            for (int32_t i = 0; i < params.nway_n_chunks; ++i) {
+                chunk_paths.emplace_back(params.nway_chunk_paths[i]);
+            }
+        } else if (nway_manifest.contains("chunk_files")) {
+            const auto manifest_dir = nway_manifest_path.parent_path();
+            for (const auto & cf : nway_manifest.at("chunk_files")) {
+                chunk_paths.emplace_back((manifest_dir / cf.get<std::string>()).string());
+            }
+        } else {
+            throw std::runtime_error("N-Way manifest has no chunk_files and --nway-chunks was not provided");
+        }
+
+        pimpl->nway_n_chunks = (int32_t) chunk_paths.size();
+        pimpl->nway_chunk_paths = chunk_paths;
+
+        // Open file descriptors with O_RDONLY (bypass mmap for these).
+        pimpl->nway_fds.resize(chunk_paths.size());
+        for (size_t i = 0; i < chunk_paths.size(); ++i) {
+            const int fd = open(chunk_paths[i].c_str(), O_RDONLY);
+            if (fd < 0) {
+                throw std::runtime_error(format("failed to open N-Way chunk file %zu: %s (errno=%d)",
+                        i, chunk_paths[i].c_str(), errno));
+            }
+            pimpl->nway_fds[i] = fd;
+            LLAMA_LOG_INFO("%s: N-Way opened chunk %zu: %s (fd=%d)\n",
+                    __func__, i, chunk_paths[i].c_str(), fd);
+        }
+
+        // Parse tensor entries from the manifest.
+        if (nway_manifest.contains("entries")) {
+            for (const auto & item : nway_manifest.at("entries")) {
+                llama_model::impl::nway_tensor_entry entry;
+                entry.tensor_name       = item.at("tensor_name").get<std::string>();
+                entry.tensor_family     = item.value("tensor_family", std::string());
+                entry.layer             = item.value("layer", -1);
+                entry.n_experts         = item.value("n_experts", 0);
+                entry.bytes_per_expert  = item.value("bytes_per_expert", size_t(0));
+                entry.exact_byte_length = item.value("exact_byte_length", size_t(0));
+                entry.aligned_byte_length = item.value("aligned_byte_length", size_t(0));
+
+                if (item.contains("fragments")) {
+                    for (const auto & frag : item.at("fragments")) {
+                        llama_model::impl::nway_fragment f;
+                        f.file_id = frag.at("file_id").get<int32_t>();
+                        f.offset  = frag.at("offset").get<size_t>();
+                        f.size    = frag.at("size").get<size_t>();
+
+                        if (f.file_id < 0 || f.file_id >= pimpl->nway_n_chunks) {
+                            throw std::runtime_error(format(
+                                "N-Way manifest entry '%s' fragment references invalid file_id %d (have %d chunks)",
+                                entry.tensor_name.c_str(), f.file_id, pimpl->nway_n_chunks));
+                        }
+                        entry.fragments.push_back(f);
+                    }
+                }
+
+                pimpl->nway_entries.emplace(entry.tensor_name, std::move(entry));
+            }
+        }
+
+        pimpl->nway_enabled = true;
+        LLAMA_LOG_INFO("%s: N-Way weighted I/O scheduler enabled with %d chunk files and %zu tensor entries\n",
+                __func__, pimpl->nway_n_chunks, pimpl->nway_entries.size());
     }
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
@@ -8700,6 +8816,34 @@ const llama_flash_moe_sidecar_entry * llama_model::flash_moe_sidecar_entry_for(c
     return &it->second;
 }
 
+// ---- N-Way Weighted I/O Scheduler accessors ----
+
+bool llama_model::nway_enabled() const {
+    return pimpl->nway_enabled;
+}
+
+int32_t llama_model::nway_n_chunks() const {
+    return pimpl->nway_n_chunks;
+}
+
+const std::vector<int> & llama_model::nway_fds() const {
+    return pimpl->nway_fds;
+}
+
+const std::vector<std::string> & llama_model::nway_chunk_paths() const {
+    return pimpl->nway_chunk_paths;
+}
+
+const llama_model::nway_tensor_entry * llama_model::nway_entry_for(const char * name) const {
+    const auto it = pimpl->nway_entries.find(name);
+    if (it == pimpl->nway_entries.end()) {
+        return nullptr;
+    }
+    // The public nway_tensor_entry and impl::nway_tensor_entry have identical
+    // member layout.  We reinterpret_cast rather than copy for zero-overhead access.
+    return reinterpret_cast<const nway_tensor_entry *>(&it->second);
+}
+
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
     return hparams.is_swa(il) ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
 }
@@ -9406,6 +9550,9 @@ llama_model_params llama_model_default_params() {
         /*.moe_mode                    =*/ nullptr,
         /*.moe_trace_file              =*/ nullptr,
         /*.moe_quant_map               =*/ nullptr,
+        /*.nway_manifest_path          =*/ nullptr,
+        /*.nway_chunk_paths            =*/ nullptr,
+        /*.nway_n_chunks               =*/ 0,
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,

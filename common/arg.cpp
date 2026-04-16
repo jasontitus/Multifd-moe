@@ -2381,6 +2381,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_VERIFY_SIDECAR"));
     add_opt(common_arg(
+        {"--nway-manifest"}, "PATH",
+        "N-Way weighted I/O scheduler manifest (JSON) produced by tools/gguf-nway-split.py; fans out expert reads across multiple volumes",
+        [](common_params & params, const std::string & value) {
+            params.nway_manifest = value;
+        }
+    ).set_env("LLAMA_ARG_NWAY_MANIFEST"));
+    add_opt(common_arg(
+        {"--nway-chunks"}, "PATH1 PATH2 ...",
+        "explicit paths to N-Way chunk files (overrides chunk_files in the manifest); "
+        "accepts a variable number of paths terminated by the next flag or end of arguments",
+        [](common_params & params, const std::string & value) {
+            params.nway_chunks.push_back(value);
+        }
+    ).set_env("LLAMA_ARG_NWAY_CHUNKS"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

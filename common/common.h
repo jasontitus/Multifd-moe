@@ -638,6 +638,8 @@ struct common_params {
 
     std::string moe_sidecar   = "";      // Flash-MoE sidecar directory or manifest path              // NOLINT
     std::string moe_mode      = "stock"; // Flash-MoE runtime mode                                     // NOLINT
+    std::string nway_manifest = "";      // N-Way weighted I/O manifest path                           // NOLINT
+    std::vector<std::string> nway_chunks;  // N-Way chunk file paths                                   // NOLINT
     std::string moe_trace     = "";      // reserved trace output path                                 // NOLINT
     std::string moe_quant_map = "";      // reserved dynamic-quant policy path                         // NOLINT
     std::string oracle_dump   = "";      // llama-cli tensor oracle dump directory                     // NOLINT
