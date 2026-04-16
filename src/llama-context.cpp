@@ -146,6 +146,12 @@ public:
             nway_enabled = true;
             nway_fds = model.nway_fds();  // copy FD vector (model owns the FDs)
 
+            // Build FD-to-index reverse lookup and per-FD stats.
+            nway_per_fd_stats.resize(nway_fds.size());
+            for (int32_t i = 0; i < (int32_t) nway_fds.size(); ++i) {
+                nway_fd_to_idx[nway_fds[i]] = i;
+            }
+
             // Ensure the read pool is started for multi-FD dispatch.
             if (read_pool.workers.empty()) {
                 start_read_pool();
@@ -743,6 +749,134 @@ private:
     // N-Way Weighted I/O Scheduler state (cached from model).
     bool nway_enabled = false;
     std::vector<int> nway_fds;  // borrowed FDs from llama_model — do NOT close
+
+    // ---- N-Way per-FD instrumentation ----
+    // Tracks latency (microseconds) and bytes per pread op, grouped by file_id,
+    // so that p50/p99 latency and throughput can be reported at session end.
+    struct nway_fd_stats {
+        uint64_t    ops          = 0;   // number of pread ops completed
+        uint64_t    bytes        = 0;   // total bytes read
+        int64_t     total_us     = 0;   // sum of per-op elapsed_us (wall-clock overlap not removed)
+        std::vector<int64_t> latencies_us;  // individual op latencies for percentile computation
+        std::vector<double>  throughputs_gbps; // per-op throughput (GB/s) for percentile computation
+    };
+    std::vector<nway_fd_stats> nway_per_fd_stats;
+    std::mutex nway_stats_mutex;  // guards nway_per_fd_stats from concurrent read-pool workers
+
+    // Map an FD value back to its nway index for stats attribution.
+    std::unordered_map<int, int32_t> nway_fd_to_idx;
+
+    // Record completed pread task metrics into per-FD stats.
+    // Call this after every execute_pread_tasks() that involves nway tasks.
+    void record_nway_pread_stats(const std::vector<pread_task> & tasks) {
+        if (!nway_enabled || nway_per_fd_stats.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(nway_stats_mutex);
+        for (const auto & task : tasks) {
+            auto it = nway_fd_to_idx.find(task.fd);
+            if (it == nway_fd_to_idx.end()) {
+                continue; // not an nway FD — skip (single-FD fallback tasks)
+            }
+            const int32_t idx = it->second;
+            auto & stats = nway_per_fd_stats[idx];
+            stats.ops++;
+            const size_t actual_bytes = task.result > 0 ? (size_t) task.result : 0;
+            stats.bytes += actual_bytes;
+            stats.total_us += task.elapsed_us;
+            stats.latencies_us.push_back(task.elapsed_us);
+            if (task.elapsed_us > 0 && actual_bytes > 0) {
+                // GB/s = bytes / (us * 1e-6) / 1e9 = bytes / (us * 1000)
+                const double gbps = double(actual_bytes) / (double(task.elapsed_us) * 1000.0);
+                stats.throughputs_gbps.push_back(gbps);
+            }
+        }
+    }
+
+    // Compute a percentile from a (mutable) vector.  Uses nth_element for O(n).
+    static double percentile(std::vector<int64_t> & v, double pct) {
+        if (v.empty()) return 0.0;
+        const size_t n = v.size();
+        const size_t idx = std::min<size_t>((size_t)(pct / 100.0 * double(n)), n - 1);
+        std::nth_element(v.begin(), v.begin() + idx, v.end());
+        return double(v[idx]);
+    }
+
+    static double percentile_d(std::vector<double> & v, double pct) {
+        if (v.empty()) return 0.0;
+        const size_t n = v.size();
+        const size_t idx = std::min<size_t>((size_t)(pct / 100.0 * double(n)), n - 1);
+        std::nth_element(v.begin(), v.begin() + idx, v.end());
+        return v[idx];
+    }
+
+    void log_nway_fd_stats() const {
+        if (!nway_enabled || nway_per_fd_stats.empty()) {
+            return;
+        }
+
+        // Check if any FD had traffic.
+        uint64_t total_ops = 0;
+        for (const auto & s : nway_per_fd_stats) {
+            total_ops += s.ops;
+        }
+        if (total_ops == 0) {
+            return;
+        }
+
+        LLAMA_LOG_INFO("%s: N-Way per-volume I/O statistics (%d volumes, %" PRIu64 " total ops):\n",
+                __func__, (int) nway_per_fd_stats.size(), total_ops);
+
+        // We need mutable copies for nth_element.
+        for (int32_t i = 0; i < (int32_t) nway_per_fd_stats.size(); ++i) {
+            const auto & s = nway_per_fd_stats[i];
+            if (s.ops == 0) {
+                LLAMA_LOG_INFO("%s:   vol[%d] fd=%d  (no ops)\n", __func__, i,
+                        i < (int32_t) nway_fds.size() ? nway_fds[i] : -1);
+                continue;
+            }
+
+            // Compute percentiles from mutable copies.
+            std::vector<int64_t> lat = s.latencies_us;
+            std::vector<double> thr = s.throughputs_gbps;
+
+            const double p50_lat_us = percentile(lat, 50.0);
+            const double p99_lat_us = percentile(lat, 99.0);
+            const double avg_lat_us = double(s.total_us) / double(s.ops);
+            const double total_gib  = double(s.bytes) / (1024.0 * 1024.0 * 1024.0);
+
+            // Aggregate throughput: total_bytes / total_time.
+            const double agg_gbps = s.total_us > 0
+                ? double(s.bytes) / (double(s.total_us) * 1000.0)
+                : 0.0;
+
+            // Per-op throughput percentiles.
+            const double p50_thr = percentile_d(thr, 50.0);
+            const double p99_thr = percentile_d(thr, 99.0);
+
+            LLAMA_LOG_INFO(
+                "%s:   vol[%d] fd=%d  ops=%" PRIu64
+                "  bytes=%.2f GiB"
+                "  lat_avg=%.1f us  lat_p50=%.1f us  lat_p99=%.1f us"
+                "  thr_agg=%.3f GB/s  thr_p50=%.3f GB/s  thr_p99=%.3f GB/s\n",
+                __func__, i,
+                i < (int32_t) nway_fds.size() ? nway_fds[i] : -1,
+                s.ops, total_gib,
+                avg_lat_us, p50_lat_us, p99_lat_us,
+                agg_gbps, p50_thr, p99_thr);
+        }
+
+        // Emit a suggested weights line based on measured aggregate throughput.
+        LLAMA_LOG_INFO("%s:   suggested --weights based on measured throughput:", __func__);
+        for (int32_t i = 0; i < (int32_t) nway_per_fd_stats.size(); ++i) {
+            const auto & s = nway_per_fd_stats[i];
+            const double agg_gbps = (s.total_us > 0 && s.bytes > 0)
+                ? double(s.bytes) / (double(s.total_us) * 1000.0)
+                : 0.0;
+            LLAMA_LOG_INFO(" %.2f", agg_gbps);
+        }
+        LLAMA_LOG_INFO("\n");
+    }
     std::unordered_map<ggml_backend_dev_t, async_slot_uploader> async_uploaders;
     read_thread_pool read_pool;
     std::vector<int32_t> topk_ids;
@@ -1717,6 +1851,9 @@ private:
                     stats.topk_read_us / 1000.0, stats.slot_resolve_us / 1000.0,
                     stats.install_us / 1000.0, stats.slot_write_us / 1000.0, stats.trace_write_us / 1000.0);
         }
+
+        // N-Way per-volume I/O statistics.
+        log_nway_fd_stats();
     }
 
     int fd_for(const std::string & path) {
@@ -2054,7 +2191,9 @@ private:
         if (nway_entry == nullptr) {
             // Tensor not in the nway manifest — fall back to the standard
             // single-FD path silently.
-            return { .bytes = SIZE_MAX }; // sentinel: caller should use default path
+            install_metrics sentinel;
+            sentinel.bytes = SIZE_MAX; // sentinel: caller should use default path
+            return sentinel;
         }
 
         // Compute the byte range for this expert within the full tensor.
@@ -2116,6 +2255,9 @@ private:
 
         // Dispatch all fragment reads in parallel via the thread pool.
         execute_pread_tasks(tasks);
+
+        // Record per-FD instrumentation.
+        record_nway_pread_stats(tasks);
 
         // Verify results.
         ssize_t total_read = 0;
@@ -2485,6 +2627,7 @@ private:
                     }
 
                     execute_pread_tasks(tasks);
+                    if (nway_enabled) { record_nway_pread_stats(tasks); }
 
                     for (auto & slot_buffer : slot_buffers) {
                         for (const auto & install_field : slot_buffer.fields) {
@@ -2615,6 +2758,7 @@ private:
                     }
 
                     execute_pread_tasks(tasks);
+                    if (nway_enabled) { record_nway_pread_stats(tasks); }
 
                     for (auto & chunk : chunks) {
                         install_metrics metrics;
