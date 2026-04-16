@@ -39,7 +39,8 @@ from pathlib import Path
 # Constants — match the C++ runtime exactly
 # ---------------------------------------------------------------------------
 PAGE_SIZE = 16384             # 16 KB — Apple Silicon page alignment
-N_POOL_WORKERS = 8           # matches `constexpr size_t n_workers = 8` in C++
+DEFAULT_THREADS_PER_DEVICE = 2  # matches LLAMA_FLASH_MOE_READ_POOL_THREADS_PER_DEVICE default
+BASE_POOL_WORKERS = 8         # floor for non-nway case (matches C++ `constexpr size_t base = 8`)
 DEFAULT_BLOCK_SIZE = 2 * 1024 * 1024   # 2 MiB — typical expert tensor slice
 DEFAULT_ITERATIONS = 200
 DEFAULT_FILE_SIZE = 256 * 1024 * 1024  # 256 MiB bench file per drive
@@ -84,10 +85,21 @@ class VolumeStats:
 #   - Master waits on work_done until all workers report in
 # ---------------------------------------------------------------------------
 
+def compute_pool_workers(n_volumes: int, threads_per_device: int = DEFAULT_THREADS_PER_DEVICE) -> int:
+    """Compute read pool worker count — mirrors effective_read_pool_workers() in C++."""
+    env_val = os.environ.get("LLAMA_FLASH_MOE_READ_POOL_WORKERS", "")
+    if env_val.strip().isdigit() and int(env_val) > 0:
+        return int(env_val)
+    env_tpd = os.environ.get("LLAMA_FLASH_MOE_READ_POOL_THREADS_PER_DEVICE", "")
+    if env_tpd.strip().isdigit() and int(env_tpd) > 0:
+        threads_per_device = int(env_tpd)
+    return max(BASE_POOL_WORKERS, n_volumes * threads_per_device)
+
+
 class ReadThreadPool:
     """Python replica of the C++ read_thread_pool in llama-context.cpp."""
 
-    def __init__(self, n_workers: int = N_POOL_WORKERS):
+    def __init__(self, n_workers: int):
         self.n_workers = n_workers
         self._tasks: list[PreadTask] = []
         self._generation = 0
@@ -269,17 +281,18 @@ def bench_manifest(
         if batch.tasks:
             expert_batches.append(batch)
 
+    n_pool = compute_pool_workers(n_vols)
     total_tasks = sum(len(b.tasks) for b in expert_batches)
     print(f"[nway-bench] Manifest:        {manifest_path}")
     print(f"[nway-bench] Volumes:         {n_vols}")
     print(f"[nway-bench] Expert batches:  {len(expert_batches)}")
     print(f"[nway-bench] Total tasks:     {total_tasks}")
-    print(f"[nway-bench] Pool workers:    {N_POOL_WORKERS} (matching C++ runtime)")
-    print(f"[nway-bench] Dispatch:        round-robin stride={N_POOL_WORKERS}, per-expert barrier")
+    print(f"[nway-bench] Pool workers:    {n_pool} ({DEFAULT_THREADS_PER_DEVICE}/device, matching C++ runtime)")
+    print(f"[nway-bench] Dispatch:        round-robin stride={n_pool}, per-expert barrier")
     print(f"[nway-bench] Iterations:      {iterations} (+ {WARMUP_ITERATIONS} warmup)")
     print()
 
-    _run_benchmark(fds, expert_batches, iterations, stats, parallel)
+    _run_benchmark(fds, expert_batches, iterations, stats, parallel, n_pool)
 
     for fd in fds:
         os.close(fd)
@@ -336,17 +349,18 @@ def bench_raw_drives(
                 ))
             expert_batches.append(batch)
 
+        n_pool = compute_pool_workers(n_vols)
         total_tasks = sum(len(b.tasks) for b in expert_batches)
         print(f"\n[nway-bench] Drives:          {n_vols}")
         print(f"[nway-bench] Block size:      {block_size / 1024:.0f} KiB")
         print(f"[nway-bench] Expert batches:  {len(expert_batches)} (1 per block offset)")
         print(f"[nway-bench] Total tasks:     {total_tasks}")
-        print(f"[nway-bench] Pool workers:    {N_POOL_WORKERS} (matching C++ runtime)")
-        print(f"[nway-bench] Dispatch:        round-robin stride={N_POOL_WORKERS}, per-expert barrier")
+        print(f"[nway-bench] Pool workers:    {n_pool} ({DEFAULT_THREADS_PER_DEVICE}/device, matching C++ runtime)")
+        print(f"[nway-bench] Dispatch:        round-robin stride={n_pool}, per-expert barrier")
         print(f"[nway-bench] Iterations:      {iterations} (+ {WARMUP_ITERATIONS} warmup)")
         print()
 
-        _run_benchmark(fds, expert_batches, iterations, stats, parallel)
+        _run_benchmark(fds, expert_batches, iterations, stats, parallel, n_pool)
 
         for fd in fds:
             os.close(fd)
@@ -371,11 +385,12 @@ def _run_benchmark(
     iterations: int,
     stats: list[VolumeStats],
     parallel: bool,
+    n_pool_workers: int,
 ) -> None:
     """Run the benchmark with the same dispatch semantics as the C++ runtime."""
 
     if parallel:
-        pool = ReadThreadPool(n_workers=N_POOL_WORKERS)
+        pool = ReadThreadPool(n_workers=n_pool_workers)
     else:
         pool = None
 

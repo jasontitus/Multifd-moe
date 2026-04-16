@@ -679,6 +679,7 @@ private:
         int tasks_completed = 0;
         int generation = 0;
         int completed_generation = 0;
+        int n_workers = 0;  // actual worker count (stored for lambda access)
         bool shutdown = false;
     };
 
@@ -1069,18 +1070,59 @@ private:
         return std::max<int32_t>(1, chunks);
     }
 
+    static size_t read_pool_workers_from_env() {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_READ_POOL_WORKERS");
+        if (value != nullptr && value[0] != '\0') {
+            const int n = std::atoi(value);
+            if (n > 0) {
+                return (size_t) n;
+            }
+        }
+        return 0; // 0 = use default
+    }
+
+    static size_t read_pool_threads_per_device_from_env() {
+        const char * value = std::getenv("LLAMA_FLASH_MOE_READ_POOL_THREADS_PER_DEVICE");
+        if (value != nullptr && value[0] != '\0') {
+            const int n = std::atoi(value);
+            if (n > 0) {
+                return (size_t) n;
+            }
+        }
+        return 2; // default: 2 threads per volume
+    }
+
+    size_t effective_read_pool_workers() const {
+        const size_t from_env = read_pool_workers_from_env();
+        if (from_env > 0) {
+            return from_env;
+        }
+        // Default: threads_per_device * n_volumes, with a floor of 8 for
+        // the non-nway case (preserves the original hardcoded behavior).
+        constexpr size_t base = 8;
+        if (nway_enabled && nway_fds.size() > 0) {
+            const size_t per_device = read_pool_threads_per_device_from_env();
+            return std::max(base, nway_fds.size() * per_device);
+        }
+        return base;
+    }
+
     void start_read_pool() {
         if (!read_pool.workers.empty()) {
             return;
         }
 
-        constexpr size_t n_workers = 8;
+        const size_t n_workers = effective_read_pool_workers();
+        LLAMA_LOG_INFO("%s: Flash-MoE read pool starting with %zu workers%s\n",
+                __func__, n_workers,
+                read_pool_workers_from_env() > 0 ? " (from LLAMA_FLASH_MOE_READ_POOL_WORKERS)" : "");
         read_pool.shutdown = false;
         read_pool.tasks = nullptr;
         read_pool.num_tasks = 0;
         read_pool.tasks_completed = 0;
         read_pool.generation = 0;
         read_pool.completed_generation = 0;
+        read_pool.n_workers = int(n_workers);
         read_pool.workers.reserve(n_workers);
         for (size_t idx = 0; idx < n_workers; ++idx) {
             read_pool.workers.emplace_back([this, idx]() {
@@ -1101,7 +1143,7 @@ private:
                         num_tasks = read_pool.num_tasks;
                     }
 
-                    const int worker_count = int(read_pool.workers.size());
+                    const int worker_count = read_pool.n_workers;
                     for (int task_idx = int(idx); task_idx < num_tasks; task_idx += worker_count) {
                         pread_task & task = tasks[task_idx];
                         const int64_t t_start_us = ggml_time_us();
@@ -1112,7 +1154,7 @@ private:
                     {
                         std::lock_guard<std::mutex> lock(read_pool.mutex);
                         read_pool.tasks_completed++;
-                        if (read_pool.tasks_completed == int(n_workers)) {
+                        if (read_pool.tasks_completed == read_pool.n_workers) {
                             read_pool.completed_generation = my_generation;
                             read_pool.work_done.notify_one();
                         }
@@ -1137,6 +1179,7 @@ private:
         read_pool.tasks = nullptr;
         read_pool.num_tasks = 0;
         read_pool.tasks_completed = 0;
+        read_pool.n_workers = 0;
     }
 
     void execute_pread_tasks(std::vector<pread_task> & tasks) {
