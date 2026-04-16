@@ -1,71 +1,69 @@
 #!/usr/bin/env python3
-"""N-Way I/O Benchmark — evaluate multi-volume drive throughput and recommend weights.
+"""N-Way I/O Benchmark — mirrors the llama.cpp Flash-MoE slot-bank I/O path.
 
-This tool mirrors the I/O pattern that llama.cpp's Flash-MoE slot-bank runtime
-performs during a generation run: sequential pread() calls of page-aligned expert
-tensors, fanned out across multiple volumes in parallel.
+This tool replicates the *exact* I/O dispatch pattern used by the C++ runtime
+in src/llama-context.cpp so that measured numbers predict real-world behavior:
 
-It reads the manifest produced by gguf-nway-split.py, opens the chunk files,
-and simulates expert fetch traffic at realistic sizes.  Reports p50/p99 latency
-and throughput per volume, aggregate throughput, and recommends --weights values
-that match measured drive performance.
+  - Fixed 8-thread persistent pool (matches `start_read_pool()` n_workers=8)
+  - Round-robin task distribution with stride=n_workers (matches the C++ worker
+    loop: `for task_idx = idx; task_idx < num_tasks; task_idx += worker_count`)
+  - Per-expert barrier: all fragments for one expert complete before the next
+    expert is dispatched (matches `execute_pread_tasks()` + `work_done.wait()`)
+  - pread() syscall via os.pread() — same kernel path as C `pread()`
+  - FDs opened with O_RDONLY only — same flags as `llama-model.cpp` line 3040
 
-Usage — benchmark existing nway split:
+Usage — benchmark existing nway split (reads the actual chunk files):
     python tools/nway-bench.py \\
         --manifest ./nway-out/model-manifest.json \\
         --iterations 200
 
-Usage — benchmark raw drive paths (no manifest needed):
+Usage — benchmark raw drives (creates temp files, no manifest needed):
     python tools/nway-bench.py \\
         --drives /Volumes/NVMe/bench /Volumes/TB4_1/bench /Volumes/TB4_2/bench \\
         --block-size 2097152 \\
         --iterations 500
-
-The --drives mode creates temporary benchmark files and measures raw sequential
-read throughput per drive, which is useful for evaluating a drive setup before
-repacking a model.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
-import statistics
-import struct
 import sys
-import tempfile
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
-
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants — match the C++ runtime exactly
 # ---------------------------------------------------------------------------
-PAGE_SIZE = 16384  # 16 KB — Apple Silicon Metal alignment
-DEFAULT_BLOCK_SIZE = 2 * 1024 * 1024  # 2 MiB — typical expert tensor size
+PAGE_SIZE = 16384             # 16 KB — Apple Silicon page alignment
+N_POOL_WORKERS = 8           # matches `constexpr size_t n_workers = 8` in C++
+DEFAULT_BLOCK_SIZE = 2 * 1024 * 1024   # 2 MiB — typical expert tensor slice
 DEFAULT_ITERATIONS = 200
 DEFAULT_FILE_SIZE = 256 * 1024 * 1024  # 256 MiB bench file per drive
 WARMUP_ITERATIONS = 10
 
 
+# ---------------------------------------------------------------------------
+# Data types
+# ---------------------------------------------------------------------------
+
 @dataclass
-class PreadResult:
-    """Result of a single pread operation."""
-    fd_idx: int
-    latency_us: float
-    bytes_read: int
-    throughput_gbps: float
+class PreadTask:
+    """Mirrors the C++ pread_task struct."""
+    fd: int
+    fd_idx: int        # volume index for stats attribution
+    offset: int
+    size: int
+    result: int = 0
+    elapsed_us: float = 0.0
 
 
 @dataclass
 class VolumeStats:
-    """Accumulated statistics for a single volume."""
+    """Per-volume accumulated statistics."""
     path: str
     ops: int = 0
     total_bytes: int = 0
@@ -74,8 +72,103 @@ class VolumeStats:
     throughputs_gbps: list[float] = field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# Thread pool that mirrors the C++ read_thread_pool
+#
+# The C++ pool uses:
+#   - A fixed set of persistent worker threads
+#   - A shared tasks pointer + count set by the master
+#   - A generation counter bumped per batch
+#   - Each worker handles tasks[idx], tasks[idx + n_workers], tasks[idx + 2*n_workers], ...
+#   - Workers signal done via tasks_completed counter + condition variable
+#   - Master waits on work_done until all workers report in
+# ---------------------------------------------------------------------------
+
+class ReadThreadPool:
+    """Python replica of the C++ read_thread_pool in llama-context.cpp."""
+
+    def __init__(self, n_workers: int = N_POOL_WORKERS):
+        self.n_workers = n_workers
+        self._tasks: list[PreadTask] = []
+        self._generation = 0
+        self._completed_generation = 0
+        self._tasks_completed = 0
+        self._shutdown = False
+
+        self._mutex = threading.Lock()
+        self._work_ready = threading.Condition(self._mutex)
+        self._work_done = threading.Condition(self._mutex)
+
+        self._workers: list[threading.Thread] = []
+        for idx in range(n_workers):
+            t = threading.Thread(target=self._worker_fn, args=(idx,), daemon=True)
+            t.start()
+            self._workers.append(t)
+
+    def _worker_fn(self, idx: int) -> None:
+        """Worker loop — mirrors the C++ lambda in start_read_pool()."""
+        my_generation = 0
+        while True:
+            # Wait for work.
+            with self._work_ready:
+                self._work_ready.wait_for(
+                    lambda: self._shutdown or self._generation != my_generation
+                )
+                if self._shutdown:
+                    return
+                my_generation = self._generation
+                tasks = self._tasks
+                num_tasks = len(tasks)
+
+            # Execute tasks with round-robin stride — exactly matching C++:
+            #   for (int task_idx = int(idx); task_idx < num_tasks; task_idx += worker_count)
+            worker_count = self.n_workers
+            task_idx = idx
+            while task_idx < num_tasks:
+                task = tasks[task_idx]
+                t0 = time.monotonic()
+                data = os.pread(task.fd, task.size, task.offset)
+                task.elapsed_us = (time.monotonic() - t0) * 1e6
+                task.result = len(data)
+                task_idx += worker_count
+
+            # Signal completion.
+            with self._mutex:
+                self._tasks_completed += 1
+                if self._tasks_completed == self.n_workers:
+                    self._completed_generation = my_generation
+                    self._work_done.notify_all()
+
+    def execute(self, tasks: list[PreadTask]) -> None:
+        """Dispatch a batch of tasks and wait for completion (per-expert barrier)."""
+        if not tasks:
+            return
+
+        with self._mutex:
+            self._tasks = tasks
+            self._tasks_completed = 0
+            self._generation += 1
+            generation = self._generation
+            self._work_ready.notify_all()
+
+        with self._work_done:
+            self._work_done.wait_for(
+                lambda: self._completed_generation >= generation or self._shutdown
+            )
+
+    def shutdown(self) -> None:
+        with self._mutex:
+            self._shutdown = True
+            self._work_ready.notify_all()
+        for w in self._workers:
+            w.join(timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
+# Stats helpers
+# ---------------------------------------------------------------------------
+
 def percentile(data: list[float], pct: float) -> float:
-    """Compute the pct-th percentile of a sorted list."""
     if not data:
         return 0.0
     s = sorted(data)
@@ -83,21 +176,47 @@ def percentile(data: list[float], pct: float) -> float:
     return s[idx]
 
 
-def do_pread(fd: int, size: int, offset: int, fd_idx: int) -> PreadResult:
-    """Perform a single pread and measure latency."""
-    t0 = time.monotonic()
-    data = os.pread(fd, size, offset)
-    elapsed_us = (time.monotonic() - t0) * 1e6
-    n = len(data)
-    gbps = n / (elapsed_us * 1000.0) if elapsed_us > 0 else 0.0
-    return PreadResult(fd_idx=fd_idx, latency_us=elapsed_us, bytes_read=n, throughput_gbps=gbps)
+def record_task_stats(tasks: list[PreadTask], stats: list[VolumeStats]) -> None:
+    """Attribute completed task metrics to per-volume stats."""
+    for task in tasks:
+        s = stats[task.fd_idx]
+        s.ops += 1
+        actual_bytes = task.result if task.result > 0 else 0
+        s.total_bytes += actual_bytes
+        s.total_us += task.elapsed_us
+        s.latencies_us.append(task.elapsed_us)
+        if task.elapsed_us > 0 and actual_bytes > 0:
+            gbps = actual_bytes / (task.elapsed_us * 1000.0)
+            s.throughputs_gbps.append(gbps)
+
+
+# ---------------------------------------------------------------------------
+# Expert-level work schedule builder
+#
+# In the real runtime, the slot-bank fetches one expert at a time:
+#   1. Look up the expert's fragments across chunk files
+#   2. Build pread_task array (one per fragment)
+#   3. execute_pread_tasks() — barrier until all fragments complete
+#   4. Next expert
+#
+# We replicate this by grouping work_items into "expert batches".
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExpertBatch:
+    """One expert fetch = a batch of fragments dispatched together with a barrier."""
+    tasks: list[PreadTask] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
 # Manifest-based benchmark
 # ---------------------------------------------------------------------------
 
-def bench_manifest(manifest_path: str, iterations: int, parallel: bool) -> list[VolumeStats]:
+def bench_manifest(
+    manifest_path: str,
+    iterations: int,
+    parallel: bool,
+) -> list[VolumeStats]:
     """Benchmark using an existing nway manifest + chunk files."""
     manifest_dir = Path(manifest_path).parent
 
@@ -112,7 +231,6 @@ def bench_manifest(manifest_path: str, iterations: int, parallel: bool) -> list[
     chunk_paths = [(manifest_dir / name).as_posix() for name in chunk_names]
     n_vols = len(chunk_paths)
 
-    # Open FDs with O_RDONLY.
     fds = []
     for p in chunk_paths:
         fd = os.open(p, os.O_RDONLY)
@@ -120,41 +238,48 @@ def bench_manifest(manifest_path: str, iterations: int, parallel: bool) -> list[
 
     stats = [VolumeStats(path=chunk_paths[i]) for i in range(n_vols)]
 
-    # Build a work schedule from the manifest entries — simulate fetching
-    # one expert from each tensor entry, cycling through entries.
-    work_items: list[tuple[int, int, int]] = []  # (fd_idx, offset, size)
+    # Build expert batches from the manifest.
+    # Each manifest entry = one tensor.  Each tensor has N fragments.
+    # In the runtime, a single expert fetch reads a slice of each fragment.
+    # For benchmarking, we treat each entry's full fragment set as one expert batch.
+    expert_batches: list[ExpertBatch] = []
     for entry in manifest.get("entries", []):
+        batch = ExpertBatch()
         for frag in entry.get("fragments", []):
             file_id = frag["file_id"]
             offset = frag["offset"]
             size = frag["size"]
             if size > 0 and file_id < n_vols:
-                work_items.append((file_id, offset, size))
+                batch.tasks.append(PreadTask(
+                    fd=fds[file_id], fd_idx=file_id,
+                    offset=offset, size=size,
+                ))
+        if batch.tasks:
+            expert_batches.append(batch)
 
-    if not work_items:
-        # No fragments — fall back to raw reads at start of each file.
+    if not expert_batches:
         file_sizes = [os.fstat(fd).st_size for fd in fds]
+        batch = ExpertBatch()
         for i in range(n_vols):
             block = min(DEFAULT_BLOCK_SIZE, file_sizes[i])
             if block > 0:
-                work_items.append((i, 0, block))
+                batch.tasks.append(PreadTask(
+                    fd=fds[i], fd_idx=i, offset=0, size=block,
+                ))
+        if batch.tasks:
+            expert_batches.append(batch)
 
-    print(f"[nway-bench] Manifest: {manifest_path}")
-    print(f"[nway-bench] Volumes: {n_vols}")
-    print(f"[nway-bench] Work items per iteration: {len(work_items)}")
-    print(f"[nway-bench] Iterations: {iterations} (+ {WARMUP_ITERATIONS} warmup)")
+    total_tasks = sum(len(b.tasks) for b in expert_batches)
+    print(f"[nway-bench] Manifest:        {manifest_path}")
+    print(f"[nway-bench] Volumes:         {n_vols}")
+    print(f"[nway-bench] Expert batches:  {len(expert_batches)}")
+    print(f"[nway-bench] Total tasks:     {total_tasks}")
+    print(f"[nway-bench] Pool workers:    {N_POOL_WORKERS} (matching C++ runtime)")
+    print(f"[nway-bench] Dispatch:        round-robin stride={N_POOL_WORKERS}, per-expert barrier")
+    print(f"[nway-bench] Iterations:      {iterations} (+ {WARMUP_ITERATIONS} warmup)")
     print()
 
-    # Warmup.
-    for _ in range(WARMUP_ITERATIONS):
-        for fd_idx, offset, size in work_items:
-            os.pread(fds[fd_idx], size, offset)
-
-    # Benchmark.
-    if parallel:
-        _bench_parallel(fds, work_items, iterations, stats)
-    else:
-        _bench_serial(fds, work_items, iterations, stats)
+    _run_benchmark(fds, expert_batches, iterations, stats, parallel)
 
     for fd in fds:
         os.close(fd)
@@ -162,41 +287,8 @@ def bench_manifest(manifest_path: str, iterations: int, parallel: bool) -> list[
     return stats
 
 
-def _bench_serial(fds, work_items, iterations, stats):
-    """Serial benchmark: issues preads one at a time."""
-    for it in range(iterations):
-        for fd_idx, offset, size in work_items:
-            result = do_pread(fds[fd_idx], size, offset, fd_idx)
-            s = stats[fd_idx]
-            s.ops += 1
-            s.total_bytes += result.bytes_read
-            s.total_us += result.latency_us
-            s.latencies_us.append(result.latency_us)
-            s.throughputs_gbps.append(result.throughput_gbps)
-
-
-def _bench_parallel(fds, work_items, iterations, stats):
-    """Parallel benchmark: fans out preads across volumes concurrently."""
-    n_workers = max(4, len(fds) * 2)
-
-    for it in range(iterations):
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futures = []
-            for fd_idx, offset, size in work_items:
-                futures.append(pool.submit(do_pread, fds[fd_idx], size, offset, fd_idx))
-
-            for future in as_completed(futures):
-                result = future.result()
-                s = stats[result.fd_idx]
-                s.ops += 1
-                s.total_bytes += result.bytes_read
-                s.total_us += result.latency_us
-                s.latencies_us.append(result.latency_us)
-                s.throughputs_gbps.append(result.throughput_gbps)
-
-
 # ---------------------------------------------------------------------------
-# Raw drive benchmark (no manifest)
+# Raw drive benchmark
 # ---------------------------------------------------------------------------
 
 def bench_raw_drives(
@@ -206,10 +298,9 @@ def bench_raw_drives(
     file_size: int,
     parallel: bool,
 ) -> list[VolumeStats]:
-    """Benchmark raw drive sequential read throughput."""
+    """Benchmark raw drive throughput with synthetic expert batches."""
     n_vols = len(drive_paths)
 
-    # Create temp benchmark files on each drive.
     bench_files: list[str] = []
     fds: list[int] = []
     try:
@@ -218,7 +309,6 @@ def bench_raw_drives(
             bench_file = os.path.join(drive, f"nway_bench_{i}.bin")
             bench_files.append(bench_file)
 
-            # Write random data (page-aligned).
             print(f"[nway-bench] Creating bench file: {bench_file} ({file_size / (1024**2):.0f} MiB)")
             with open(bench_file, "wb") as f:
                 remaining = file_size
@@ -232,31 +322,31 @@ def bench_raw_drives(
 
         stats = [VolumeStats(path=drive_paths[i]) for i in range(n_vols)]
 
-        # Build work items: sequential page-aligned reads through each file.
+        # Build expert batches: each "expert" reads one block from each volume
+        # (simulates a tensor split across all drives).
         n_blocks = file_size // block_size
-        work_items: list[tuple[int, int, int]] = []
-        for vol_idx in range(n_vols):
-            for blk in range(n_blocks):
-                offset = blk * block_size
-                work_items.append((vol_idx, offset, block_size))
+        expert_batches: list[ExpertBatch] = []
+        for blk in range(n_blocks):
+            batch = ExpertBatch()
+            offset = blk * block_size
+            for vol_idx in range(n_vols):
+                batch.tasks.append(PreadTask(
+                    fd=fds[vol_idx], fd_idx=vol_idx,
+                    offset=offset, size=block_size,
+                ))
+            expert_batches.append(batch)
 
-        print(f"\n[nway-bench] Drives: {n_vols}")
-        print(f"[nway-bench] Block size: {block_size / 1024:.0f} KiB")
-        print(f"[nway-bench] Blocks per file: {n_blocks}")
-        print(f"[nway-bench] Total work items per iteration: {len(work_items)}")
-        print(f"[nway-bench] Iterations: {iterations} (+ {WARMUP_ITERATIONS} warmup)")
+        total_tasks = sum(len(b.tasks) for b in expert_batches)
+        print(f"\n[nway-bench] Drives:          {n_vols}")
+        print(f"[nway-bench] Block size:      {block_size / 1024:.0f} KiB")
+        print(f"[nway-bench] Expert batches:  {len(expert_batches)} (1 per block offset)")
+        print(f"[nway-bench] Total tasks:     {total_tasks}")
+        print(f"[nway-bench] Pool workers:    {N_POOL_WORKERS} (matching C++ runtime)")
+        print(f"[nway-bench] Dispatch:        round-robin stride={N_POOL_WORKERS}, per-expert barrier")
+        print(f"[nway-bench] Iterations:      {iterations} (+ {WARMUP_ITERATIONS} warmup)")
         print()
 
-        # Warmup.
-        for _ in range(WARMUP_ITERATIONS):
-            for fd_idx, offset, size in work_items[:min(len(work_items), n_vols * 4)]:
-                os.pread(fds[fd_idx], size, offset)
-
-        # Benchmark.
-        if parallel:
-            _bench_parallel(fds, work_items, iterations, stats)
-        else:
-            _bench_serial(fds, work_items, iterations, stats)
+        _run_benchmark(fds, expert_batches, iterations, stats, parallel)
 
         for fd in fds:
             os.close(fd)
@@ -264,12 +354,65 @@ def bench_raw_drives(
         return stats
 
     finally:
-        # Clean up bench files.
         for bf in bench_files:
             try:
                 os.unlink(bf)
             except OSError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Core benchmark loop
+# ---------------------------------------------------------------------------
+
+def _run_benchmark(
+    fds: list[int],
+    expert_batches: list[ExpertBatch],
+    iterations: int,
+    stats: list[VolumeStats],
+    parallel: bool,
+) -> None:
+    """Run the benchmark with the same dispatch semantics as the C++ runtime."""
+
+    if parallel:
+        pool = ReadThreadPool(n_workers=N_POOL_WORKERS)
+    else:
+        pool = None
+
+    try:
+        # Warmup — run through all expert batches serially to prime OS page cache.
+        for _ in range(WARMUP_ITERATIONS):
+            for batch in expert_batches:
+                for task in batch.tasks:
+                    os.pread(task.fd, task.size, task.offset)
+
+        # Main benchmark loop.
+        for it in range(iterations):
+            for batch in expert_batches:
+                # Reset task results for this dispatch.
+                for task in batch.tasks:
+                    task.result = 0
+                    task.elapsed_us = 0.0
+
+                if pool is not None:
+                    # Parallel: dispatch through the persistent 8-thread pool
+                    # with round-robin distribution and per-expert barrier.
+                    pool.execute(batch.tasks)
+                else:
+                    # Serial: execute one task at a time (same as C++ fallback
+                    # when read_pool.workers is empty).
+                    for task in batch.tasks:
+                        t0 = time.monotonic()
+                        data = os.pread(task.fd, task.size, task.offset)
+                        task.elapsed_us = (time.monotonic() - t0) * 1e6
+                        task.result = len(data)
+
+                # Record per-FD stats (mirrors record_nway_pread_stats).
+                record_task_stats(batch.tasks, stats)
+
+    finally:
+        if pool is not None:
+            pool.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -316,16 +459,13 @@ def report_stats(stats: list[VolumeStats]) -> None:
 
     print("=" * 100)
 
-    # Overall aggregate.
     total_bytes = sum(s.total_bytes for s in stats)
-    total_us = max(s.total_us for s in stats) if stats else 0  # wall-clock is max of concurrent
+    total_us_max = max(s.total_us for s in stats) if stats else 0
     total_us_sum = sum(s.total_us for s in stats)
     total_gib = total_bytes / (1024 ** 3)
 
-    # Serial aggregate (sum of times — no parallelism credit).
     serial_gbps = total_bytes / (total_us_sum * 1000.0) if total_us_sum > 0 else 0.0
-    # Ideal parallel aggregate (limited by slowest volume).
-    parallel_gbps = total_bytes / (total_us * 1000.0) if total_us > 0 else 0.0
+    parallel_gbps = total_bytes / (total_us_max * 1000.0) if total_us_max > 0 else 0.0
 
     print(f"\n[nway-bench] Total: {total_gib:.2f} GiB across {total_ops} ops")
     print(f"[nway-bench] Aggregate throughput (serial sum): {serial_gbps:.3f} GB/s")
@@ -333,28 +473,21 @@ def report_stats(stats: list[VolumeStats]) -> None:
 
     # Recommended weights.
     if any(t > 0 for t in agg_throughputs):
-        # Normalize to the fastest drive.
         max_thr = max(agg_throughputs)
-        if max_thr > 0:
-            normalized = [t / max_thr for t in agg_throughputs]
-        else:
-            normalized = [1.0] * len(agg_throughputs)
-
-        # Round to 1 decimal place for clean CLI usage.
-        weights_str = " ".join(f"{w * max_thr:.2f}" for w in normalized)
-        norm_str = " ".join(f"{w:.2f}" for w in normalized)
+        weights_str = " ".join(f"{t:.2f}" for t in agg_throughputs)
+        norm_str = " ".join(f"{t / max_thr:.2f}" if max_thr > 0 else "1.00"
+                            for t in agg_throughputs)
 
         print(f"\n[nway-bench] Recommended --weights (raw GB/s): {weights_str}")
         print(f"[nway-bench] Recommended --weights (normalized): {norm_str}")
         print(f"\n  Usage example:")
         print(f"    python tools/gguf-nway-split.py -i model.gguf -o ./nway-out --weights {weights_str}")
 
-        # Check for imbalance.
-        if len(normalized) > 1:
-            slowest = min(normalized)
-            if slowest < 0.5:
+        if len(agg_throughputs) > 1:
+            slowest = min(t for t in agg_throughputs if t > 0) if any(t > 0 for t in agg_throughputs) else 0
+            if max_thr > 0 and slowest / max_thr < 0.5:
                 print(f"\n  WARNING: Volume imbalance detected — slowest drive is "
-                      f"{slowest:.0%} of the fastest.")
+                      f"{slowest / max_thr:.0%} of the fastest.")
                 print(f"  Consider removing the slowest volume or rebalancing the split.")
 
 
@@ -364,20 +497,26 @@ def report_stats(stats: list[VolumeStats]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="N-Way I/O Benchmark — evaluate multi-volume throughput and recommend weights",
+        description="N-Way I/O Benchmark — mirrors the llama.cpp Flash-MoE runtime I/O path",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+I/O dispatch fidelity (matches src/llama-context.cpp):
+  - 8 persistent worker threads (start_read_pool, n_workers=8)
+  - Round-robin task assignment with stride=8
+  - Per-expert completion barrier (execute_pread_tasks)
+  - pread() syscall, FDs opened with O_RDONLY only
+
 Examples:
-  # Benchmark an existing nway split (reads chunk files):
+  # Benchmark an existing nway split:
   python tools/nway-bench.py --manifest ./nway-out/model-manifest.json
 
-  # Benchmark raw drives (creates temp files, measures throughput):
+  # Benchmark raw drives before repacking:
   python tools/nway-bench.py --drives /Volumes/NVMe/bench /Volumes/TB4/bench
 
-  # Increase iterations for more stable percentiles:
+  # More iterations for stable percentiles:
   python tools/nway-bench.py --manifest ./nway-out/model-manifest.json -n 500
 
-  # Serial mode (no parallelism, measures pure single-drive speed):
+  # Serial mode (no thread pool, measures pure single-drive speed):
   python tools/nway-bench.py --drives /Volumes/NVMe/bench --serial -n 1000
 """,
     )
@@ -409,12 +548,12 @@ Examples:
         "--file-size",
         type=int,
         default=DEFAULT_FILE_SIZE,
-        help=f"Temp file size in bytes for --drives mode (default: {DEFAULT_FILE_SIZE})",
+        help=f"Temp file size for --drives mode in bytes (default: {DEFAULT_FILE_SIZE})",
     )
     parser.add_argument(
         "--serial",
         action="store_true",
-        help="Run reads serially instead of in parallel (measures single-drive speed)",
+        help="Run reads serially (no thread pool) — matches C++ fallback when pool is empty",
     )
 
     args = parser.parse_args()
